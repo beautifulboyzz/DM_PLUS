@@ -1,326 +1,384 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import unicodedata
+from datetime import datetime, date
 
-# ==========================================
-# 1. 配置区 (每日详细版)
-# ==========================================
-DATA_FOLDER = r"D:\SAR日频\全部品种日线"
-OUTPUT_FOLDER = r"D:\SAR日频\Dual Momentum（双重动量）"
-START_DATE = "2025-01-01"
-END_DATE = "2025-12-31"
+# ================= 1. 系统配置 =================
+st.set_page_config(page_title="Dual Momentum回测系统", layout="wide", page_icon="⚡")
 
-# --- 核心策略参数 ---
-LOOKBACK_SHORT = 5  # 短期动量
-LOOKBACK_LONG = 20  # 长期动量
-FILTER_MA = 60  # 趋势过滤
-ATR_WINDOW = 20  # 波动率窗口
+# --- A. 字体与显示适配 (解决Linux/云端中文乱码) ---
+# 优先尝试加载项目根目录下的 SimHei.ttf
+FONT_FILE = "SimHei.ttf" 
+if os.path.exists(FONT_FILE):
+    my_font = fm.FontProperties(fname=FONT_FILE)
+else:
+    # 本地 Windows 兜底
+    my_font = fm.FontProperties(family='SimHei')
 
-# --- 仓位与缓冲 ---
-HOLD_NUM = 5  # 目标持仓数
-BUFFER_RANK = 8  # 排名缓冲 (前8名不换股)
+# --- B. 路径自动适配 ---
+# 优先本地路径，其次 relative path (data/)
+local_absolute_path = r"D:\SAR日频\全部品种日线"
+relative_path = "data"
 
-# --- 成本与风控 ---
-STOP_LOSS_PCT = 0.04  # 4% 止损
-COMMISSION = 0.0000  # 万3
-SLIPPAGE = 0.0000  # 万5
-RISK_FREE_RATE = 0.0
+if os.path.exists(local_absolute_path):
+    DEFAULT_DATA_FOLDER = local_absolute_path
+elif os.path.exists(relative_path):
+    DEFAULT_DATA_FOLDER = relative_path
+else:
+    DEFAULT_DATA_FOLDER = "."
 
+# ================= 2. 数据处理 (保持健壮性) =================
 
-# ==========================================
-# 2. 辅助类 (日志增强)
-# ==========================================
-class Logger:
-    def __init__(self, filepath):
-        self.filepath = filepath
-        folder = os.path.dirname(filepath)
-        if not os.path.exists(folder): os.makedirs(folder)
-        with open(self.filepath, 'w', encoding='utf-8') as f:
-            f.write(f"====== 实战双重动量 (每日详细日志版) ======\n")
-            f.write(f"参数: Top{HOLD_NUM} (Buffer{BUFFER_RANK}), StopLoss={STOP_LOSS_PCT * 100}%\n")
-            f.write("==================================================\n\n")
-
-    def log(self, content, print_to_console=True):
-        if print_to_console: print(content)
-        with open(self.filepath, 'a', encoding='utf-8') as f: f.write(content + "\n")
-
-
-# ==========================================
-# 3. 数据加载
-# ==========================================
-def load_data(folder):
-    print("正在加载数据...")
-    price_dict, vol_dict, low_dict, open_dict = {}, {}, {}, {}
-    if not os.path.exists(folder): return None, None, None, None
-
-    files = [f for f in os.listdir(folder) if f.endswith('.csv')]
-    for file in files:
-        path = os.path.join(folder, file)
+def read_robust_csv(f):
+    for enc in ['gbk', 'utf-8', 'gb18030', 'cp936']:
         try:
-            try:
-                df = pd.read_csv(path, encoding='gbk')
-            except:
-                df = pd.read_csv(path, encoding='utf-8')
+            df = pd.read_csv(f, encoding=enc, engine='python')
+            cols = [str(c).strip() for c in df.columns]
+            rename_map = {}
+            for c in df.columns:
+                c_str = str(c).strip()
+                if c_str in ['日期', '日期/时间', 'date', 'Date']: rename_map[c] = 'date'
+                if c_str in ['收盘价', '收盘', 'close', 'price', 'Close']: rename_map[c] = 'close'
+                if c_str in ['最高价', '最高', 'high', 'High']: rename_map[c] = 'high'
+                if c_str in ['最低价', '最低', 'low', 'Low']: rename_map[c] = 'low'
+                if c_str in ['开盘价', '开盘', 'open', 'Open']: rename_map[c] = 'open'
 
-            # 映射列名
-            rename_map = {'日期/时间': 'date', 'Date': 'date', '收盘价': 'close', 'Close': 'close',
-                          '最高价': 'high', 'High': 'high', '最低价': 'low', 'Low': 'low', '开盘价': 'open',
-                          'Open': 'open'}
-            for col in df.columns:
-                for k, v in rename_map.items():
-                    if k in col and v not in df.columns: df.rename(columns={col: v}, inplace=True)
+            df.rename(columns=rename_map, inplace=True)
+            if 'date' in df.columns and 'close' in df.columns:
+                return df
+        except: continue
+    return None
 
+@st.cache_data(ttl=3600)
+def load_data_and_calc_atr(folder, atr_window=20):
+    if not os.path.exists(folder):
+        return None, None, None, None, f"路径不存在: {folder}"
+
+    try:
+        files = sorted([f for f in os.listdir(folder) if f.endswith('.csv')])
+    except:
+        return None, None, None, None, "无法读取目录"
+
+    if not files:
+        return None, None, None, None, "无CSV文件"
+
+    price_dict, vol_dict, low_dict, open_dict = {}, {}, {}, {}
+    progress_bar = st.progress(0, text="正在加载数据...")
+
+    for i, file in enumerate(files):
+        file_norm = unicodedata.normalize('NFC', file)
+        if "纤维板" in file_norm or "胶合板" in file_norm or "线材" in file_norm: continue
+
+        name = file_norm.split('.')[0].replace("主连", "").replace("日线", "")
+        path = os.path.join(folder, file)
+        df = read_robust_csv(path)
+        if df is None: continue
+
+        try:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df.dropna(subset=['date', 'close', 'high', 'low', 'open'], inplace=True)
             df['date'] = df['date'].dt.normalize()
+            df.sort_values('date', inplace=True)
+            df = df[~df.index.duplicated(keep='last')]
             df.set_index('date', inplace=True)
-            df.sort_index(inplace=True)
 
-            # 计算 NATR
             prev_close = df['close'].shift(1)
-            tr = pd.concat([df['high'] - df['low'], (df['high'] - prev_close).abs(), (df['low'] - prev_close).abs()],
-                           axis=1).max(axis=1)
-            atr = tr.rolling(ATR_WINDOW).mean()
+            tr = pd.concat([df['high'] - df['low'], (df['high'] - prev_close).abs(), (df['low'] - prev_close).abs()], axis=1).max(axis=1)
+            atr = tr.rolling(atr_window).mean()
             natr = atr / df['close']
 
-            name = file.split('.')[0]
             price_dict[name] = df['close']
             vol_dict[name] = natr
             low_dict[name] = df['low']
             open_dict[name] = df['open']
-        except:
-            continue
+        except: continue
 
-    return pd.DataFrame(price_dict).ffill(), pd.DataFrame(vol_dict).ffill(), \
-        pd.DataFrame(low_dict).ffill(), pd.DataFrame(open_dict).ffill()
+        if i % 10 == 0: progress_bar.progress((i + 1) / len(files), text=f"加载: {name}")
+
+    progress_bar.empty()
+    
+    if not price_dict: return None, None, None, None, "数据解析为空"
+
+    return (pd.DataFrame(price_dict).ffill(), pd.DataFrame(vol_dict).ffill(), 
+            pd.DataFrame(low_dict).ffill(), pd.DataFrame(open_dict).ffill(), None)
 
 
-# ==========================================
-# 4. 核心回测引擎 (每日逐行输出)
-# ==========================================
-def run_strategy(df_p, df_v, df_l, df_o, logger):
-    logger.log("开始回测 (逐日模式)...", True)
+# ================= 3. 核心策略逻辑 (已同步 1.py 的所有高级逻辑) =================
 
-    # 1. 因子计算
-    mom_short = df_p.pct_change(LOOKBACK_SHORT)
-    mom_long = df_p.pct_change(LOOKBACK_LONG)
+def run_strategy_logic(df_p, df_v, df_l, df_o, params):
+    # 解包参数
+    lookback_short = params['short']
+    lookback_long = params['long']
+    hold_num = params['hold_num']
+    buffer_rank = params['buffer_rank'] # 新增：排名缓冲
+    filter_ma = params['ma']
+    stop_loss_pct = params['stop_loss_pct']
+    commission_rate = params.get('commission', 0.0)
+    slippage_rate = params.get('slippage', 0.0)
+
+    start_date = pd.to_datetime(params['start_date'])
+    end_date = pd.to_datetime(params['end_date'])
+
+    # 因子计算
+    mom_short = df_p.pct_change(lookback_short)
+    mom_long = df_p.pct_change(lookback_long)
     momentum_score = 0.4 * mom_short + 0.6 * mom_long
-    ma_filter = df_p > df_p.rolling(FILTER_MA).mean()
-
-    # 2. 变量初始化
+    ma_filter = df_p > df_p.rolling(filter_ma).mean()
+    
+    # 准备回测
     dates = df_p.index
     capital = 1.0
     nav_record = []
     asset_contribution = {}
-
+    logs = []
+    
     current_holdings = {}
     entry_prices = {}
+    
+    # 定位起点
+    try: start_idx = dates.get_indexer([start_date], method='bfill')[0]
+    except: start_idx = 0
+    min_idx = max(lookback_long, filter_ma, 20)
+    start_idx = max(start_idx, min_idx)
+    
+    if start_idx >= len(dates): return pd.DataFrame(), pd.DataFrame(), ["数据不足"]
 
-    start_idx = 0
-    min_calc_window = max(LOOKBACK_LONG, FILTER_MA, ATR_WINDOW)
-    for i, d in enumerate(dates):
-        if d >= pd.to_datetime(START_DATE) and i >= min_calc_window:
-            start_idx = i
-            break
+    cycle_details = []
+    cycle_count = 1
 
-    total_cost = 0.0
-
-    # --- 逐日循环 ---
+    # --- 逐日回测 ---
     for i in range(start_idx, len(dates)):
         curr_date = dates[i]
+        if curr_date > end_date: break
         prev_date = dates[i - 1]
-        if curr_date > pd.to_datetime(END_DATE): break
-
-        # --- A. 选股与目标权重 ---
+        
         target_holdings = {}
+        daily_cost = 0.0
+
+        # A. 选股 (包含 Buffer Logic)
         try:
             scores = momentum_score.loc[prev_date].dropna()
             valid_pool = [a for a in scores.index if ma_filter.loc[prev_date, a]]
             ranked_pool = scores.loc[valid_pool].sort_values(ascending=False)
-
-            # 排名缓冲逻辑
+            
+            # --- 核心同步：排名缓冲逻辑 ---
             keepers = []
             for asset in current_holdings.keys():
                 if asset in ranked_pool.index:
                     rank = ranked_pool.index.get_loc(asset) + 1
-                    if rank <= BUFFER_RANK: keepers.append(asset)
-
-            slots_needed = HOLD_NUM - len(keepers)
+                    if rank <= buffer_rank: keepers.append(asset)
+            
+            slots_needed = hold_num - len(keepers)
             new_picks = []
             if slots_needed > 0:
                 for asset in ranked_pool.index:
                     if asset not in keepers:
                         new_picks.append(asset)
                         if len(new_picks) == slots_needed: break
-
+            
             final_assets = keepers + new_picks
-
+            
             if final_assets:
                 vols = df_v.loc[prev_date, final_assets]
                 inv = 1.0 / (vols + 1e-6)
                 target_holdings = (inv / inv.sum()).to_dict()
+                
+            # 计算成本
+            turnover = 0.0
+            all_assets = set(current_holdings.keys()) | set(target_holdings.keys())
+            for a in all_assets:
+                w_old = current_holdings.get(a, 0.0)
+                w_new = target_holdings.get(a, 0.0)
+                turnover += abs(w_new - w_old)
+                if w_new > 0 and w_old == 0: # 记录新开仓成本价
+                    entry_prices[a] = df_p.loc[prev_date, a]
+            
+            daily_cost = turnover * (commission_rate + slippage_rate)
+            current_holdings = target_holdings.copy()
+
         except:
             target_holdings = {}
-
-        # --- B. 生成调仓日志 (对比 Target vs Current) ---
-        action_log = []
-        all_assets = set(current_holdings.keys()) | set(target_holdings.keys())
-        turnover = 0.0
-
-        for asset in all_assets:
-            w_old = current_holdings.get(asset, 0.0)
-            w_new = target_holdings.get(asset, 0.0)
-            turnover += abs(w_new - w_old)
-
-            if w_old == 0 and w_new > 0:
-                action_log.append(f"开仓 {asset}({w_new:.1%})")
-                entry_prices[asset] = df_p.loc[prev_date, asset]  # 记录成本
-            elif w_old > 0 and w_new == 0:
-                action_log.append(f"清仓 {asset}")
-            elif abs(w_new - w_old) > 0.01:  # 变动超过1%才显示，避免日志太乱
-                action_log.append(f"调整 {asset}({w_old:.1%}->{w_new:.1%})")
-
-        daily_cost = turnover * (COMMISSION + SLIPPAGE)
-        total_cost += daily_cost
-        current_holdings = target_holdings.copy()
-
-        # --- C. 计算收益与风控 ---
+            current_holdings = {}
+        
+        # B. 结算与风控 (包含 Gap Logic)
         daily_gross_pnl = 0.0
-        risk_msgs = []
-
+        stopped_assets = []
+        
         for asset, w in list(current_holdings.items()):
             if w == 0: continue
-
+            
             ref_price = entry_prices.get(asset, df_p.loc[prev_date, asset])
-            stop_price = ref_price * (1 - STOP_LOSS_PCT)
-
+            stop_price = ref_price * (1 - stop_loss_pct)
+            
             today_open = df_o.loc[curr_date, asset]
             today_low = df_l.loc[curr_date, asset]
             today_close = df_p.loc[curr_date, asset]
             prev_close = df_p.loc[prev_date, asset]
-
+            
             triggered = False
             actual_ret = 0.0
-
-            if today_open < stop_price:  # 跳空
+            
+            # --- 核心同步：真实跳空逻辑 ---
+            if today_open < stop_price:
                 actual_ret = (today_open - prev_close) / prev_close
                 triggered = True
-                risk_msgs.append(f"!!! {asset} 跳空止损 (开盘:{today_open})")
-            elif today_low < stop_price:  # 盘中
+                stopped_assets.append(f"{asset}(跳空)")
+            elif today_low < stop_price:
                 actual_ret = (stop_price - prev_close) / prev_close
                 triggered = True
-                risk_msgs.append(f"!!! {asset} 盘中止损 (低点:{today_low})")
+                stopped_assets.append(f"{asset}(触及)")
             else:
                 actual_ret = (today_close - prev_close) / prev_close
-
+                
             daily_gross_pnl += w * actual_ret
             asset_contribution[asset] = asset_contribution.get(asset, 0.0) + w * actual_ret
-
+            
             if triggered:
                 current_holdings[asset] = 0
                 if asset in entry_prices: del entry_prices[asset]
-
-        daily_net_ret = daily_gross_pnl - daily_cost
-        capital *= (1 + daily_net_ret)
+        
+        daily_net_pnl = daily_gross_pnl - daily_cost
+        capital *= (1 + daily_net_pnl)
         nav_record.append({'date': curr_date, 'nav': capital})
+        
+        # 日志缓存
+        cycle_details.append({
+            'date': curr_date, 'ret': daily_net_pnl, 'cost': daily_cost,
+            'nav': capital, 'hold': current_holdings.copy(), 'stop': stopped_assets[:]
+        })
+        
+        if stopped_assets:
+            logs.append(f"⚠️ [{curr_date.date()}] 风控: {', '.join(stopped_assets)}")
 
-        # --- D. 输出每日日志 ---
-        date_str = curr_date.strftime("%Y-%m-%d")
+        # 周期输出
+        if len(cycle_details) == 5 or i == len(dates) - 1 or curr_date == end_date:
+            c_ret = (np.prod([1+d['ret'] for d in cycle_details]) - 1)
+            c_cost = sum([d['cost'] for d in cycle_details])
+            
+            h_str = f"=== 周期 {cycle_count} ({cycle_details[0]['date'].date()} ~ {cycle_details[-1]['date'].date()}) "
+            h_str += f"收益: {c_ret*100:+.2f}% | 成本: {c_cost*10000:.1f}bp | 净值: {capital:.4f} ==="
+            logs.append(h_str)
+            
+            for d in cycle_details:
+                h_txt = ",".join([f"{k}({v:.0%})" for k,v in d['hold'].items() if v>0]) or "空仓"
+                s_txt = f" [止损:{','.join(d['stop'])}]" if d['stop'] else ""
+                logs.append(f"  [{d['date'].date()}] {d['ret']*100:+.2f}% | 成本:{d['cost']*10000:.0f}bp | 持仓: {h_txt}{s_txt}")
+            
+            logs.append("-" * 40)
+            cycle_details = []
+            cycle_count += 1
 
-        # 1. 标题行
-        logger.log(f"[{date_str}] 净值: {capital:.4f} ({daily_net_ret * 100:+.2f}%) | 成本: {daily_cost * 10000:.1f}bp",
-                   True)
+    return pd.DataFrame(nav_record), pd.DataFrame(list(asset_contribution.items()), columns=['Asset', 'Contribution']), logs
 
-        # 2. 持仓详情
-        hold_str = ", ".join([f"{a}:{w * 100:.0f}%" for a, w in current_holdings.items() if w > 0])
-        if not hold_str: hold_str = "空仓"
-        logger.log(f"  持仓: {hold_str}", True)
+# ================= 4. UI 界面 =================
 
-        # 3. 调仓动作 (如果有)
-        if action_log:
-            logger.log(f"  调仓: {', '.join(action_log)}", True)
+with st.sidebar:
+    st.header("Dual Momentum (Pro)")
+    st.caption(f"源: `{DEFAULT_DATA_FOLDER}`")
+    data_folder = st.text_input("数据路径", value=DEFAULT_DATA_FOLDER)
+    
+    st.divider()
+    col1, col2 = st.columns(2)
+    start_d = col1.date_input("开始", pd.to_datetime("2025-01-01"))
+    end_d = col2.date_input("结束", pd.to_datetime("2025-12-31"))
+    
+    st.subheader("⚙️ 仓位风控")
+    c1, c2 = st.columns(2)
+    hold_num = c1.number_input("持仓数", 1, 20, 5)
+    buffer_rank = c2.number_input("排名缓冲", 1, 20, 8, help="前X名不换股 (逻辑同步自1.py)")
+    stop_loss = st.number_input("止损 (%)", 0.0, 20.0, 4.0, step=0.5) / 100.0
+    
+    st.subheader("💸 交易成本")
+    cc1, cc2 = st.columns(2)
+    comm_bp = cc1.number_input("手续费(bp)", 0.0, 50.0, 0.0)
+    slip_bp = cc2.number_input("滑点(bp)", 0.0, 50.0, 0.0)
 
-        # 4. 风控警报 (如果有)
-        if risk_msgs:
-            logger.log(f"  风控: {' | '.join(risk_msgs)}", True)
+    with st.expander("🛠️ 因子参数"):
+        s_win = st.number_input("短期窗口", value=5)
+        l_win = st.number_input("长期窗口", value=20)
+        ma_win = st.number_input("均线过滤", value=60)
+        atr_win = st.number_input("ATR周期", value=20)
+        
+    run_btn = st.button("🚀 运行策略", type="primary", use_container_width=True)
 
-        # 分隔线
-        if i % 5 == 0: logger.log("-" * 40, False)  # 文件里加分隔线，控制台不加
+# 主显示区
+st.title("Dual Momentum 实战回测")
 
-    return pd.DataFrame(nav_record).set_index('date'), pd.DataFrame(list(asset_contribution.items()),
-                                                                    columns=['Asset', 'Contrib'])
-
-
-# ==========================================
-# 5. 报表生成 (不变)
-# ==========================================
-def create_report(res_df, contrib_df, logger):
-    if res_df.empty: return
-    # 绘图字体设置
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
-    plt.rcParams['axes.unicode_minus'] = False
-
-    # --- 1. 计算核心指标 ---
-    # 总收益
-    total_ret = res_df['nav'].iloc[-1] - 1
-    # 交易天数转换年化
-    days = (res_df.index[-1] - res_df.index[0]).days
-    ann_ret = (1 + total_ret) ** (365 / days) - 1 if days > 0 else 0
-
-    # 最大回撤
-    dd_series = (res_df['nav'] - res_df['nav'].cummax()) / res_df['nav'].cummax()
-    max_dd = dd_series.min()
-
-    # 夏普率 (假设无风险利率为0)
-    daily_rets = res_df['nav'].pct_change().dropna()
-    volatility = daily_rets.std() * np.sqrt(252)  # 年化波动率
-    sharpe = (ann_ret - RISK_FREE_RATE) / volatility if volatility != 0 else 0
-
-    # 卡玛率
-    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
-
-    # --- 2. 打印详细成绩单 ---
-    logger.log("\n" + "=" * 20 + " 最终绩效评估 " + "=" * 20, True)
-    logger.log(f"1. 收益表现:", True)
-    logger.log(f"   - 总收益率: {total_ret * 100:+.2f}%", True)
-    logger.log(f"   - 年化收益: {ann_ret * 100:+.2f}%", True)
-    logger.log(f"\n2. 风险特征:", True)
-    logger.log(f"   - 最大回撤: {max_dd * 100:+.2f}% (最惨时的跌幅)", True)
-    logger.log(f"   - 年化波动: {volatility * 100:.2f}% (账户晃动的幅度)", True)
-    logger.log(f"\n3. 性价比指标:", True)
-    logger.log(f"   - 夏普率 (Sharpe): {sharpe:.2f} (每承担1单位波动赚取的收益，>1为佳)", True)
-    logger.log(f"   - 卡玛率 (Calmar): {calmar:.2f} (年化收益/最大回撤，>1.5为优秀)", True)
-    logger.log("=" * 54 + "\n", True)
-
-    # --- 3. 绘图 (保持不变) ---
-    x_data = res_df.index.to_numpy()
-    y_nav = res_df['nav'].to_numpy()
-    y_dd = dd_series.to_numpy()
-
-    plt.figure(figsize=(12, 8))
-    ax1 = plt.subplot(2, 1, 1)
-    ax1.plot(x_data, y_nav, color='#d62728', linewidth=2, label='Daily Strategy')
-    ax1.fill_between(x_data, y_nav, 1, color='#d62728', alpha=0.1)
-    ax1.set_title(f"策略净值 | Sharpe:{sharpe:.2f} | Calmar:{calmar:.2f} | Ret:{total_ret * 100:.1f}%")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    ax2.fill_between(x_data, y_dd, 0, color='gray', alpha=0.3)
-    ax2.plot(x_data, y_dd, color='gray', linewidth=1)
-    ax2.set_title(f"动态回撤 (最大回撤: {max_dd * 100:.2f}%)")
-    ax2.grid(True, alpha=0.3)
-
-    plt.savefig(os.path.join(OUTPUT_FOLDER, "Daily_Report.jpg"))
-    contrib_df.to_csv(os.path.join(OUTPUT_FOLDER, "Asset_Contrib.csv"), index=False, encoding='gbk')
-    print(f"\n图表已保存: {os.path.join(OUTPUT_FOLDER, 'Daily_Report.jpg')}")
-
-
-if __name__ == '__main__':
-    if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
-    logger = Logger(os.path.join(OUTPUT_FOLDER, "Daily_Log.txt"))
-    df_p, df_v, df_l, df_o = load_data(DATA_FOLDER)
-    if df_p is not None:
-        r_df, c_df = run_strategy(df_p, df_v, df_l, df_o, logger)
-        create_report(r_df, c_df, logger)
+if run_btn:
+    with st.spinner("加载数据..."):
+        df_p, df_v, df_l, df_o, err = load_data_and_calc_atr(data_folder, atr_win)
+    
+    if err:
+        st.error(err)
+    else:
+        params = {
+            'short': s_win, 'long': l_win, 'ma': ma_win,
+            'hold_num': hold_num, 'buffer_rank': buffer_rank, # 关键参数
+            'stop_loss_pct': stop_loss,
+            'start_date': start_d, 'end_date': end_d,
+            'commission': comm_bp/10000, 'slippage': slip_bp/10000
+        }
+        
+        with st.spinner("策略计算中..."):
+            res_nav, res_contrib, res_logs = run_strategy_logic(df_p, df_v, df_l, df_o, params)
+            
+        if res_nav.empty:
+            st.warning("无交易结果")
+        else:
+            res_nav.set_index('date', inplace=True)
+            res_contrib.sort_values('Contribution', ascending=False, inplace=True)
+            
+            # 指标计算
+            tot_ret = res_nav['nav'].iloc[-1] - 1
+            days = (res_nav.index[-1] - res_nav.index[0]).days
+            ann_ret = (1 + tot_ret) ** (365/days) - 1 if days > 0 else 0
+            dd = (res_nav['nav'] - res_nav['nav'].cummax()) / res_nav['nav'].cummax()
+            max_dd = dd.min()
+            d_rets = res_nav['nav'].pct_change().dropna()
+            sharpe = (d_rets.mean()*252) / (d_rets.std()*np.sqrt(252)) if d_rets.std()!=0 else 0
+            calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
+            
+            # 显示指标
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("总收益", f"{tot_ret*100:.2f}%")
+            k2.metric("年化", f"{ann_ret*100:.2f}%")
+            k3.metric("最大回撤", f"{max_dd*100:.2f}%")
+            k4.metric("夏普", f"{sharpe:.2f}")
+            
+            t1, t2, t3 = st.tabs(["📈 净值曲线", "📊 盈亏分布", "📝 交易日志"])
+            
+            # --- 核心修改：Matplotlib 绘图 (移除回撤子图) ---
+            with t1:
+                # 显式创建 Figure，避免 st.pyplot() 调用空白
+                fig, ax = plt.subplots(figsize=(10, 5))
+                
+                # 只画净值，不画回撤
+                x = res_nav.index
+                y = res_nav['nav']
+                ax.plot(x, y, color='#d62728', lw=2, label='Strategy Nav')
+                ax.fill_between(x, y, 1, color='#d62728', alpha=0.1)
+                
+                # 设置标题字体
+                title_str = f"Net Value Curve | Ret:{tot_ret*100:.1f}% | MaxDD:{max_dd*100:.1f}%"
+                ax.set_title(title_str, fontproperties=my_font, fontsize=12)
+                
+                ax.grid(True, alpha=0.3)
+                ax.legend(prop=my_font)
+                
+                # 传递 fig 对象，确保不显示空白
+                st.pyplot(fig)
+                
+            # --- 盈亏分布 ---
+            with t2:
+                if not res_contrib.empty:
+                    st.dataframe(res_contrib.style.format({'Contribution': '{:.2%}'}).background_gradient(cmap='RdYlGn'), use_container_width=True)
+            
+            # --- 日志 ---
+            with t3:
+                st.text_area("详细日志", "\n".join(res_logs), height=500)
+else:
+    st.info("👈 请在左侧确认参数并点击【运行策略】")
