@@ -230,7 +230,7 @@ def run_strategy_logic(df_p, df_v, df_l, df_o, params):
             elif today_low < stop_price:
                 actual_ret = (stop_price - prev_close) / prev_close
                 triggered = True
-                stopped_assets.append(f"{asset}(触及)")
+                stopped_assets.append(f"{asset}(止损)")
             else:
                 actual_ret = (today_close - prev_close) / prev_close
                 
@@ -382,3 +382,4 @@ if run_btn:
                 st.text_area("详细日志", "\n".join(res_logs), height=500)
 else:
     st.info("👈 请在左侧确认参数并点击【运行策略】")
+
