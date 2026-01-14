@@ -306,7 +306,7 @@ with st.sidebar:
     run_btn = st.button("🚀 运行策略", type="primary", use_container_width=True)
 
 # 主显示区
-st.title("Dual Momentum 实战回测")
+st.title("Dual Momentum 回测")
 
 if run_btn:
     with st.spinner("加载数据..."):
@@ -382,4 +382,5 @@ if run_btn:
                 st.text_area("详细日志", "\n".join(res_logs), height=500)
 else:
     st.info("👈 请在左侧确认参数并点击【运行策略】")
+
 
